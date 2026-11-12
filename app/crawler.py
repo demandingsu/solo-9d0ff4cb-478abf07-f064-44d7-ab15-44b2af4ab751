@@ -79,7 +79,10 @@ SECTION_LABEL_RE = re.compile(
     r"标段(?:编号|号|名称)?|标包(?:编号|号)?|"
     r"分包(?:编号|号)?|合同包(?:编号|号)?|包(?:编号|号)|分包号)"
     r"\s*(?:为|是)?\s*[：:]\s*"
-    r"([^\s，。；;、|（(\n]{1,40})"
+    # A lot field may enumerate several lots ("标段号：1、2").  Keep the
+    # separator inside the captured value so every listed lot survives the
+    # list-page pre-filter instead of only the first one.
+    r"([^\s，。；;|（(\n]{1,40})"
 )
 
 SECTION_INLINE_RE = re.compile(
@@ -382,6 +385,9 @@ def _deadline_label_candidates(text: str) -> list[dict[str, Any]]:
                 "ambiguous": ambiguous,
                 "label": label,
                 "position": label_match.start(),
+                # Text between the deadline label and its value.  It can carry
+                # the lot qualifier, e.g. "投标截止时间（2标段）：……".
+                "between": between,
             }
         )
     return results
@@ -433,6 +439,372 @@ class DeadlineInfo:
     unclear: bool = False
     quoted_old: datetime | None = None
     quoted_old_raw: str | None = None
+    # How the deadline relates to the requested lot:
+    #   target  - stated for the target lot itself
+    #   shared  - stated once for several lots (may be adopted if no specific)
+    #   other   - stated only for a different lot (must not affect the target)
+    #   ambiguous - present, but cannot be attributed to one lot
+    #   none    - no deadline field at all
+    scope: str = "target"
+    problem: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Multi-lot deadline attribution
+# ---------------------------------------------------------------------------
+
+_LOT_TOKEN = r"[0-9A-Za-z一二三四五六七八九十百]+"
+_LOT_LIST = rf"{_LOT_TOKEN}(?:\s*[、,，/]\s*{_LOT_TOKEN})*"
+_LOT_MENTION_RE = re.compile(
+    r"(?:"
+    rf"(?:第\s*)?(?P<prefix_lots>{_LOT_LIST})\s*"
+    r"(?:标段(?:[（(]包[）)])?|标包|分包|合同包|包)"
+    r"|"
+    r"(?:标段(?:[（(]包[）)])?|标包|分包|合同包|包)(?:编号|号)?"
+    rf"\s*(?:为|是)?\s*[：:]?\s*(?P<suffix_lots>{_LOT_LIST})"
+    r"|"
+    r"(?:标段(?:[（(]包[）)])?|标包|分包|合同包|包)"
+    rf"\s*[（(]\s*(?P<paren_lots>{_LOT_LIST})\s*[）)]"
+    r")"
+)
+
+# Phrases that mark a deadline as applying to several lots at once.
+_SHARED_MARKER_RE = re.compile(
+    r"(?:各(?:个)?标段|所有标段|全部标段|各(?:个)?标包|所有标包|"
+    r"各(?:个)?分包|所有分包|各(?:个)?包|所有包|不分标段|"
+    r"统一|均|共用|共同|一并|仅适用于|适用于|以上标段|上述标段)"
+)
+
+_ATTRIBUTION_PROBLEM = "公告中的截止时间无法明确归属目标标段（公告涉及多个标段）"
+
+
+def _canonical_lots(raw: str) -> list[str]:
+    lots: list[str] = []
+    for part in re.split(r"[、,，/]+", normalize_width(raw)):
+        canonical = canonical_section(part)
+        if canonical:
+            lots.append(canonical)
+    return lots
+
+
+def _lot_mentions(span: str) -> list[tuple[int, int, list[str]]]:
+    """Return lot references found in *span*, in textual order."""
+
+    mentions: list[tuple[int, int, list[str]]] = []
+    for match in _LOT_MENTION_RE.finditer(span):
+        raw = next(
+            (
+                match.group(name)
+                for name in ("prefix_lots", "suffix_lots", "paren_lots")
+                if match.group(name)
+            ),
+            "",
+        )
+        lots = _canonical_lots(raw)
+        if lots:
+            mentions.append((match.start(), match.end(), lots))
+    return mentions
+
+
+def _deadline_lot_context(text: str, position: int) -> tuple[list[str] | None, str]:
+    """Find the lot qualifier that precedes a deadline label.
+
+    The qualifier may sit on the same line ("2标段投标截止时间"), after a
+    separator on the same line ("1标段：……；2标段：……"), or on the line just
+    above a per-lot value.  Only the closest preceding reference is used; a
+    later sibling lot must never leak into the target's conclusion.
+    """
+
+    line_start = text.rfind("\n", 0, position) + 1
+    current = text[line_start:position]
+    cut = max(current.rfind(ch) for ch in ("。", "；", ";", "|"))
+    segment = current[cut + 1 :] if cut != -1 else current
+    mentions = _lot_mentions(segment)
+    if mentions:
+        return mentions[-1][2], segment
+
+    if line_start > 0:
+        previous_end = line_start - 1
+        previous_start = text.rfind("\n", 0, previous_end) + 1
+        previous = text[previous_start:previous_end]
+        mentions = _lot_mentions(previous)
+        if mentions:
+            return mentions[-1][2], previous
+        return None, previous + "\n" + segment
+    return None, segment
+
+
+def _attribute_candidates(
+    text: str,
+    candidates: list[dict[str, Any]],
+    target_section: str,
+    declared_lots: set[str],
+) -> list[dict[str, Any]]:
+    """Tag each deadline candidate with the lot it belongs to."""
+
+    target = canonical_section(target_section)
+    annotated: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        between = item.get("between") or ""
+        between_mentions = _lot_mentions(between)
+        context = ""
+        lots: list[str] | None = None
+        if between_mentions:
+            lots = between_mentions[-1][2]
+            context = between
+            if len(lots) == 1:
+                scope = "target" if lots[0] == target else "other"
+            else:
+                scope = "shared" if target in lots else "other"
+        else:
+            lots, context = _deadline_lot_context(text, int(item["position"]))
+            if lots is not None:
+                if len(lots) == 1:
+                    scope = "target" if lots[0] == target else "other"
+                else:
+                    scope = "shared" if target in lots else "other"
+            elif _SHARED_MARKER_RE.search(context):
+                scope = "shared"
+            else:
+                scope = "unmarked"
+        item.update(scope=scope, lots=lots, context=context)
+        annotated.append(item)
+
+    # An unlabelled deadline is only treated as shared when the notice offers
+    # no lot-specific deadline at all and there is exactly one such value.
+    # Multiple unlabelled values (or values mixed with other-lot values) are
+    # an attribution problem, never a licence to borrow another lot's time.
+    lot_specific_exists = any(
+        item["scope"] in {"target", "other"}
+        and item.get("lots")
+        and len(item["lots"]) == 1
+        for item in annotated
+    )
+    unmarked = [item for item in annotated if item["scope"] == "unmarked"]
+    if unmarked:
+        if not lot_specific_exists and len(unmarked) == 1:
+            unmarked[0]["scope"] = "shared"
+        else:
+            for item in unmarked:
+                item["scope"] = "ambiguous"
+    return annotated
+
+
+def _deadline_from_candidate(
+    candidate: dict[str, Any],
+    scope: str,
+) -> DeadlineInfo:
+    return DeadlineInfo(
+        value=candidate["dt"],
+        raw=candidate["raw"],
+        has_time=candidate["has_time"],
+        explicit=True,
+        scope=scope,
+    )
+
+
+def _extract_original_for_section(
+    label_candidates: list[dict[str, Any]],
+) -> DeadlineInfo:
+    current_target = [
+        item
+        for item in label_candidates
+        if item["scope"] == "target" and not item.get("old")
+    ]
+    current_shared = [
+        item
+        for item in label_candidates
+        if item["scope"] == "shared" and not item.get("old")
+    ]
+    ambiguous = [item for item in label_candidates if item["scope"] == "ambiguous"]
+    other = [item for item in label_candidates if item["scope"] == "other"]
+
+    # A target-specific time always wins; a shared time is used only when the
+    # target lot has no dedicated time of its own.
+    if current_target:
+        return _deadline_from_candidate(current_target[0], "target")
+    if current_shared:
+        # Several distinct "shared" values cannot all apply to every lot;
+        # that is an attribution problem, not a common deadline.
+        distinct_shared = {item["dt"] for item in current_shared}
+        if len(distinct_shared) > 1:
+            return DeadlineInfo(
+                value=None,
+                explicit=False,
+                unclear=True,
+                scope="ambiguous",
+                problem=_ATTRIBUTION_PROBLEM,
+            )
+        return _deadline_from_candidate(current_shared[0], "shared")
+    if ambiguous:
+        return DeadlineInfo(
+            value=None,
+            explicit=False,
+            unclear=True,
+            scope="ambiguous",
+            problem=_ATTRIBUTION_PROBLEM,
+        )
+    if other:
+        return DeadlineInfo(value=None, explicit=False, scope="other")
+    return DeadlineInfo(scope="none")
+
+
+def _extract_extension_for_section(
+    text: str,
+    label_candidates: list[dict[str, Any]],
+    marker_candidates: list[dict[str, Any]],
+    is_postponement: bool,
+) -> DeadlineInfo:
+    # Marker values ("延期至……") are explicitly new.  Prefer a marker that
+    # belongs to the target lot, then one that is shared by several lots.
+    target_markers = [item for item in marker_candidates if item["scope"] == "target"]
+    shared_markers = [item for item in marker_candidates if item["scope"] == "shared"]
+    ambiguous_markers = [item for item in marker_candidates if item["scope"] == "ambiguous"]
+    other_markers = [item for item in marker_candidates if item["scope"] == "other"]
+
+    if target_markers:
+        return _deadline_from_candidate(target_markers[-1], "target")
+    if shared_markers:
+        return _deadline_from_candidate(shared_markers[-1], "shared")
+
+    current_target = [
+        item
+        for item in label_candidates
+        if item["scope"] == "target"
+        and not item.get("old")
+        and not item.get("ambiguous")
+    ]
+    current_shared = [
+        item
+        for item in label_candidates
+        if item["scope"] == "shared"
+        and not item.get("old")
+        and not item.get("ambiguous")
+    ]
+    ambiguous = [
+        item
+        for item in label_candidates + marker_candidates
+        if item["scope"] == "ambiguous"
+    ]
+    other = [
+        item
+        for item in label_candidates + marker_candidates
+        if item["scope"] == "other"
+    ]
+
+    if current_target:
+        return _deadline_from_candidate(current_target[-1], "target")
+    if current_shared:
+        distinct_shared = {item["dt"] for item in current_shared}
+        if len(distinct_shared) > 1:
+            return DeadlineInfo(
+                value=None,
+                explicit=False,
+                unclear=True,
+                scope="ambiguous",
+                problem=_ATTRIBUTION_PROBLEM,
+            )
+        return _deadline_from_candidate(current_shared[-1], "shared")
+    if ambiguous or ambiguous_markers:
+        return DeadlineInfo(
+            value=None,
+            explicit=False,
+            unclear=True,
+            scope="ambiguous",
+            problem=_ATTRIBUTION_PROBLEM,
+        )
+    if other_markers or other:
+        # The notice visibly changes only another lot.  That is a clear
+        # "different lot" signal, not an unclear value, so it must leave the
+        # target lot's earlier conclusion untouched.
+        return DeadlineInfo(value=None, explicit=False, scope="other")
+
+    old = next(
+        (
+            item
+            for item in label_candidates
+            if item.get("old") and item["scope"] in {"target", "shared"}
+        ),
+        None,
+    )
+    if old is None and label_candidates:
+        old = label_candidates[-1]
+    unclear = bool(
+        is_postponement
+        or POSTPONE_RE.search(text[-300:])
+        or any(item.get("ambiguous") for item in label_candidates)
+    )
+    return DeadlineInfo(
+        value=None,
+        quoted_old=old["dt"] if old else None,
+        quoted_old_raw=old["raw"] if old else None,
+        explicit=False,
+        unclear=unclear,
+        scope="none",
+    )
+
+
+def extract_deadline_for_section(
+    text: str,
+    notice_type: str,
+    is_postponement: bool,
+    target_section: str,
+    section_candidates: Sequence[str],
+    data_value: str | None = None,
+) -> DeadlineInfo:
+    """Extract the deadline that genuinely belongs to *target_section*.
+
+    A notice can cover several lots at once.  Deadline values are attributed
+    to the lot named next to them; a common value is only used when the
+    target lot has no lot-specific value, and another lot's value is never
+    borrowed.  Single-lot notices therefore keep their previous result.
+    """
+
+    declared_lots: set[str] = set()
+    for candidate in section_candidates:
+        for part in re.split(r"[、,，;；|]+", normalize_width(candidate)):
+            canonical = canonical_section(part)
+            if canonical:
+                declared_lots.add(canonical)
+    target = canonical_section(target_section)
+
+    if data_value:
+        parsed = parse_datetime(data_value)
+        if parsed:
+            scope = "target" if len(declared_lots) <= 1 else "shared"
+            return DeadlineInfo(
+                value=parsed[0],
+                raw=data_value,
+                has_time=parsed[1],
+                explicit=True,
+                scope=scope,
+            )
+
+    # Preserve the exact single-lot semantics.
+    if len(declared_lots) <= 1:
+        return extract_deadline(text, notice_type, is_postponement, data_value=None)
+
+    if target not in declared_lots:
+        return DeadlineInfo(value=None, explicit=False, scope="other")
+
+    combined = [
+        dict(candidate, kind="label")
+        for candidate in _deadline_label_candidates(text)
+    ] + [
+        dict(candidate, kind="marker")
+        for candidate in _marker_deadline_candidates(text)
+    ]
+    attributed = _attribute_candidates(text, combined, target_section, declared_lots)
+    label_candidates = [item for item in attributed if item["kind"] == "label"]
+    marker_candidates = [item for item in attributed if item["kind"] == "marker"]
+
+    if notice_type == "extension":
+        return _extract_extension_for_section(
+            text, label_candidates, marker_candidates, is_postponement
+        )
+    return _extract_original_for_section(label_candidates)
+
 
 
 def extract_deadline(
@@ -545,7 +917,12 @@ class ParsedNotice:
     text: str
 
 
-def parse_notice_html(html: str, url: str, date_hint: str | None = None) -> ParsedNotice:
+def parse_notice_html(
+    html: str,
+    url: str,
+    date_hint: str | None = None,
+    section_no: str | None = None,
+) -> ParsedNotice:
     soup = BeautifulSoup(html, "html.parser")
     container = _article(soup)
     text = visible_text(soup)
@@ -598,7 +975,17 @@ def parse_notice_html(html: str, url: str, date_hint: str | None = None) -> Pars
     deadline_data = _data_attr(
         soup, ("data-deadline", "data-bid-deadline", "data-deadline-time")
     )
-    deadline = extract_deadline(text, notice_type, is_postponement, deadline_data)
+    if section_no:
+        deadline = extract_deadline_for_section(
+            text,
+            notice_type,
+            is_postponement,
+            section_no,
+            section_candidates,
+            deadline_data,
+        )
+    else:
+        deadline = extract_deadline(text, notice_type, is_postponement, deadline_data)
 
     return ParsedNotice(
         url=url,
@@ -965,8 +1352,14 @@ def _build_changes(records: Sequence[NoticeRecord], original: NoticeRecord | Non
                 deadline_after = effective
                 deadline_after_has_time = effective_has_time
             elif parsed.deadline.unclear:
-                summary = "延期公告未明确新的截止时间；原截止时间不能直接视为有效。"
+                summary = (
+                    parsed.deadline.problem
+                    or "延期公告未明确新的截止时间；原截止时间不能直接视为有效。"
+                )
                 deadline_after = None
+            elif parsed.deadline.scope == "other":
+                summary = "该公告仅修改其他标段，目标标段的截止时间不受影响。"
+                deadline_after = effective
             else:
                 summary = "该公告未明确修改投标截止时间。"
                 deadline_after = effective
@@ -1137,7 +1530,9 @@ async def check_lot(
                 try:
                     hints = _hints_for_anchor(anchor, detail_url) if anchor is not None else (None, None, None)
                     project_hint, section_hint, date_hint = hints
-                    parsed = parse_notice_html(detail_html, source_url, date_hint)
+                    parsed = parse_notice_html(
+                        detail_html, source_url, date_hint, section_no=section_no
+                    )
                 except Exception as exc:
                     _problem(issues, detail_url, f"公告详情页解析失败：{exc.__class__.__name__}", "detail")
                     continue
@@ -1224,16 +1619,26 @@ async def check_lot(
             )
         originals = [record for record in ordered if record.parsed.notice_type == "original"]
         if originals:
-            original = originals[0]
+            # Prefer an original notice that actually carries a deadline for
+            # the target lot.  A multi-lot original may only state another
+            # lot's time, which cannot establish this lot's baseline.
+            usable_originals = [
+                record
+                for record in originals
+                if record.parsed.deadline.explicit
+                and record.parsed.deadline.value is not None
+            ]
+            original = (usable_originals or originals)[0]
             if len(originals) > 1:
                 warnings.append("找到多份原公告，已采用发布时间最早的一份。")
             if original.parsed.deadline.value is None:
-                _problem(
-                    issues,
-                    original.source_url,
-                    "原公告未提供明确的投标截止时间，无法建立有效时间基线",
-                    "parse",
-                )
+                if original.parsed.deadline.scope == "other":
+                    problem_reason = "原公告只给出了其他标段的截止时间，无法确定目标标段的时间"
+                elif original.parsed.deadline.problem:
+                    problem_reason = original.parsed.deadline.problem
+                else:
+                    problem_reason = "原公告未提供明确的投标截止时间，无法建立有效时间基线"
+                _problem(issues, original.source_url, problem_reason, "parse")
         else:
             _problem(
                 issues,
@@ -1274,7 +1679,13 @@ async def check_lot(
     elif original is None:
         reason = "未找到原公告，无法建立截止时间基线。"
     elif original.parsed.deadline.value is None:
-        reason = "原公告未提供明确的投标截止时间。"
+        if original.parsed.deadline.scope == "other":
+            reason = "原公告只给出了其他标段的截止时间，无法确定目标标段的时间。"
+        else:
+            reason = (
+                original.parsed.deadline.problem
+                or "原公告未提供明确的投标截止时间。"
+            )
     else:
         effective = original.parsed.deadline.value
         effective_raw = original.parsed.deadline.raw
@@ -1286,6 +1697,7 @@ async def check_lot(
         extension_applied = False
         unclear_extension = False
         unclear_source: NoticeRecord | None = None
+        unclear_problem: str | None = None
         terminated = False
 
         for record in ordered:
@@ -1314,10 +1726,16 @@ async def check_lot(
                 elif parsed.deadline.unclear:
                     unclear_extension = True
                     unclear_source = record
+                    unclear_problem = parsed.deadline.problem
                     effective = None
                     effective_raw = None
                     source_url = record.source_url
                     source_title = parsed.title
+                elif parsed.deadline.scope == "other":
+                    # This notice visibly changes only another lot.  It is not
+                    # an unclear target-lot value; leave the target's previous
+                    # conclusion untouched.
+                    continue
 
         if terminated:
             status_code = "terminated"
@@ -1329,7 +1747,10 @@ async def check_lot(
             status_code = "unknown"
             status_label = "无法判定"
             determinable = False
-            reason = "延期公告未明确新的投标截止时间，不能沿用旧时间。"
+            reason = (
+                unclear_problem
+                or "延期公告未明确新的投标截止时间，不能沿用旧时间。"
+            )
             effective = None
             effective_raw = None
             source_url = None
@@ -1338,7 +1759,8 @@ async def check_lot(
                 _problem(
                     issues,
                     unclear_source.source_url,
-                    "延期公告未给出新的明确截止时间，旧截止时间不能继续作为有效时间",
+                    unclear_problem
+                    or "延期公告未给出新的明确截止时间，旧截止时间不能继续作为有效时间",
                     "parse",
                 )
         elif extension_applied:

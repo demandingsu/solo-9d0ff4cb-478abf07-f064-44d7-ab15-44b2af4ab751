@@ -2,7 +2,9 @@
 
 The pages deliberately put the original notice and its follow-up notices on
 different result pages.  A second lot of the same project is included so that
-the checker's lot isolation can be demonstrated.
+the checker's lot isolation can be demonstrated, and DEMO-2026-004 shows a
+single notice that covers several lots ("标段号：1、2") with a follow-up
+extension that only moves one of them.
 """
 
 from __future__ import annotations
@@ -25,6 +27,24 @@ class Notice:
 
 
 NOTICES: tuple[Notice, ...] = (
+    Notice(
+        slug="DEMO-2026-004-multi-original",
+        project_no="DEMO-2026-004",
+        section_no="1、2",
+        notice_type="original",
+        title="滨河智慧园区二期设备采购项目（1、2标段）招标公告",
+        published_at="2026-10-06 09:00",
+        deadline=None,
+        deadline_label=None,
+        body=(
+            "受采购人委托，现对滨河智慧园区二期设备采购项目进行公开招标，两个标段分别评审。",
+            "项目编号：DEMO-2026-004；标段号：1、2。",
+            "1标段投标截止时间：2026年11月16日 09:30（北京时间）。",
+            "2标段投标截止时间：2026年11月17日 09:30（北京时间）。",
+            "投标文件应按标段分别递交至滨河公共资源交易中心。",
+        ),
+        project_name="滨河智慧园区二期设备采购项目",
+    ),
     Notice(
         slug="DEMO-2026-001-01-original",
         project_no="DEMO-2026-001",
@@ -158,6 +178,23 @@ NOTICES: tuple[Notice, ...] = (
             "已递交的投标文件将按原渠道退还。后续采购安排另行公告。",
         ),
         project_name="滨河智慧园区设备采购项目",
+    ),
+    Notice(
+        slug="DEMO-2026-004-2-extension",
+        project_no="DEMO-2026-004",
+        section_no="1、2",
+        notice_type="extension",
+        title="滨河智慧园区二期设备采购项目（2标段）延期公告",
+        published_at="2026-10-30 10:00",
+        deadline="2026-11-24 09:30",
+        deadline_label="投标截止时间（延期后）",
+        body=(
+            "因答疑澄清，现对本项目部分标段的投标截止时间作出延期。",
+            "项目编号：DEMO-2026-004；标段号：1、2。",
+            "2标段：原投标截止时间为 2026年11月17日 09:30，现延期至：2026年11月24日 09:30。",
+            "1标段投标截止时间保持不变，仍为 2026年11月16日 09:30。",
+        ),
+        project_name="滨河智慧园区二期设备采购项目",
     ),
     Notice(
         slug="DEMO-2026-002-A-result",

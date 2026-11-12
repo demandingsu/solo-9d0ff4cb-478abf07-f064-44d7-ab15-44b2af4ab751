@@ -67,6 +67,35 @@ OTHER_LOT_EXTENSION = detail(
     "延期公告",
 )
 
+# One notice covering several lots: the list row says "标段号：1、2" and the
+# detail page gives each lot its own deadline.
+MULTI_ORIGINAL = detail(
+    "P-002", "1、2", "original", "2026-10-01 09:00",
+    "标段号：1、2。1标段投标截止时间：2026年11月10日 09:30。"
+    "2标段投标截止时间：2026年11月12日 09:30。",
+    "原公告",
+)
+# A follow-up notice that only moves lot 2; lot 1 must stay untouched.
+MULTI_EXTENSION_LOT2 = detail(
+    "P-002", "1、2", "extension", "2026-10-20 09:00",
+    "标段号：1、2。2标段：原投标截止时间为2026年11月12日 09:30，"
+    "现延期至2026年11月20日 09:30。1标段投标截止时间保持不变。",
+    "延期公告",
+)
+# A notice that states one common deadline for every lot.
+SHARED_ORIGINAL = detail(
+    "P-003", "1、2", "original", "2026-10-01 09:00",
+    "标段号：1、2。各标段投标截止时间均为：2026年11月15日 09:30。",
+    "原公告",
+)
+# Several lots, several unlabelled deadlines: attribution is impossible.
+AMBIGUOUS_ORIGINAL = detail(
+    "P-004", "1、2", "original", "2026-10-01 09:00",
+    "标段号：1、2。投标截止时间：2026年11月10日 09:30；"
+    "投标截止时间：2026年11月12日 09:30。",
+    "原公告",
+)
+
 
 class CrawlerTests(unittest.IsolatedAsyncioTestCase):
     def make_factory(self, routes: dict[str, str], failing: set[str] | None = None):
@@ -204,6 +233,87 @@ class CrawlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["effective_deadline"], "2026-11-09 09:30")
         self.assertEqual(
             result["deadline_source_url"], "http://test/d/extension"
+        )
+
+    async def test_multi_lot_notice_attributes_each_lots_own_deadline(self):
+        routes = {
+            "/list": link_list("P-002", "1、2", ["/d/multi"]),
+            "/d/multi": MULTI_ORIGINAL,
+        }
+        factory = self.make_factory(routes)
+        lot1 = (
+            await check_lot(
+                "http://test/list", "P-002", "1", client_factory=factory
+            )
+        ).as_dict()
+        lot2 = (
+            await check_lot(
+                "http://test/list", "P-002", "2", client_factory=factory
+            )
+        ).as_dict()
+        # Lot 2 must not be missed just because the row lists two lots, and
+        # lot 1's time must not leak into lot 2's conclusion.
+        self.assertEqual(lot1["effective_deadline"], "2026-11-10 09:30")
+        self.assertEqual(lot2["effective_deadline"], "2026-11-12 09:30")
+        self.assertTrue(lot1["determinable"])
+        self.assertTrue(lot2["determinable"])
+
+    async def test_extension_for_lot2_does_not_change_lot1(self):
+        routes = {
+            "/list": link_list(
+                "P-002", "1、2", ["/d/multi", "/d/ext2"]
+            ),
+            "/d/multi": MULTI_ORIGINAL,
+            "/d/ext2": MULTI_EXTENSION_LOT2,
+        }
+        factory = self.make_factory(routes)
+        lot1 = (
+            await check_lot(
+                "http://test/list", "P-002", "1", client_factory=factory
+            )
+        ).as_dict()
+        lot2 = (
+            await check_lot(
+                "http://test/list", "P-002", "2", client_factory=factory
+            )
+        ).as_dict()
+        self.assertEqual(lot1["status"], "ongoing")
+        self.assertEqual(lot1["effective_deadline"], "2026-11-10 09:30")
+        self.assertTrue(lot1["determinable"])
+        self.assertEqual(lot2["status"], "extended")
+        self.assertEqual(lot2["effective_deadline"], "2026-11-20 09:30")
+
+    async def test_shared_deadline_applies_to_each_lot(self):
+        routes = {
+            "/list": link_list("P-003", "1、2", ["/d/shared"]),
+            "/d/shared": SHARED_ORIGINAL,
+        }
+        factory = self.make_factory(routes)
+        for lot in ("1", "2"):
+            result = (
+                await check_lot(
+                    "http://test/list", "P-003", lot, client_factory=factory
+                )
+            ).as_dict()
+            self.assertEqual(result["effective_deadline"], "2026-11-15 09:30")
+            self.assertTrue(result["determinable"])
+
+    async def test_unattributable_deadline_is_indeterminate_with_source(self):
+        routes = {
+            "/list": link_list("P-004", "1、2", ["/d/ambiguous"]),
+            "/d/ambiguous": AMBIGUOUS_ORIGINAL,
+        }
+        result = (
+            await check_lot(
+                "http://test/list", "P-004", "2",
+                client_factory=self.make_factory(routes),
+            )
+        ).as_dict()
+        self.assertEqual(result["status"], "unknown")
+        self.assertFalse(result["determinable"])
+        self.assertIsNone(result["effective_deadline"])
+        self.assertIn(
+            "http://test/d/ambiguous", [f["url"] for f in result["failures"]]
         )
 
 

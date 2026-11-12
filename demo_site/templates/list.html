@@ -28,7 +28,7 @@
            data-section-no="{{ notice.section_no }}">
           {{ notice.title }}
         </a>
-        <div class="subline">项目编号 {{ notice.project_no }} · 标段/包 {{ notice.section_no }}</div>
+        <div class="subline">项目编号 {{ notice.project_no }} · 标段号：{{ notice.section_no }}</div>
       </td>
       <td><span class="type-tag type-{{ notice.notice_type }}">{{ type_labels[notice.notice_type] }}</span></td>
       <td class="date-cell">{{ notice.published_at }}</td>
@@ -61,5 +61,5 @@
   {% endif %}
 </nav>
 
-<p class="demo-note">共 {{ total_count }} 条公告。可核验项目 <code>DEMO-2026-001</code> 的 01、02 标段，或项目 <code>DEMO-2026-002</code> 的 A 包。</p>
+<p class="demo-note">共 {{ total_count }} 条公告。可核验项目 <code>DEMO-2026-001</code> 的 01、02 标段，项目 <code>DEMO-2026-002</code> 的 A 包，或项目 <code>DEMO-2026-004</code> 的 1、2 标段（多标段共用一条公告）。</p>
 {% endblock %}

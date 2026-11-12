@@ -133,6 +133,20 @@ def _demo_presets() -> list[dict[str, str]]:
             "section_no": "A",
             "note": "A 包；结果公告不应改变截止时间",
         },
+        {
+            "name": "多标段公告 · 2 标段已延期",
+            "list_url": DEMO_LIST_URL,
+            "project_no": "DEMO-2026-004",
+            "section_no": "2",
+            "note": "原公告标段号 1、2；延期公告只改 2 标段",
+        },
+        {
+            "name": "多标段公告 · 1 标段不受影响",
+            "list_url": DEMO_LIST_URL,
+            "project_no": "DEMO-2026-004",
+            "section_no": "1",
+            "note": "同一条公告；2 标段的延期不得改变 1 标段结论",
+        },
     ]
     for preset in presets:
         preset["href"] = "/check?" + urlencode(
